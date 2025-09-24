@@ -1,22 +1,25 @@
-# Source: https://www.youtube.com/watch?v=kCc8FmEb1nY
-# Decoder only without the model creation New*
-# Works on character-level New*
+# Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
+# Decoder with model creation New*
+# Works on character-level
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import pickle
+import time
+start_time = time.time()
 
 # hyperparameters
-batch_size = 16  # Increased for faster training if memory allows
-block_size = 64  # Increased to capture more context
+batch_size = 8  # Increased for faster training if memory allows
+block_size = 16  # Increased to capture more context
 max_iters = 5000  # Increased for potentially better convergence
-eval_interval = 500
+eval_interval = 1000
 learning_rate = 2e-3  # Lowered for more stable learning
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-n_embed = 64 # Increased for capturing richer embeddings
+eval_iters = 100
+n_embed = 32 # Increased for capturing richer embeddings
 n_head = 4
-n_layer = 6
+n_layer = 2
 dropout = 0.2
 
 torch.manual_seed(1337)
@@ -25,6 +28,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 chars = sorted(list(set(text)))
+words = sorted(list(set(text.split())))
 vocab_size = len(chars)
 
 stoi = {ch: i for i, ch in enumerate(chars)}
@@ -54,13 +58,12 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
+            X, Y = get_batch(split)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
-
-
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -72,10 +75,10 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B,T,head_size = x.shape
+        B,T,C = x.shape
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * head_size**-0.5
+        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
@@ -118,8 +121,10 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embed)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
+        y = self.sa(x)
+        x = self.ln1(x + y)
+        y = self.ffwd(x)
+        x = self.ln2(x + y)
         return x
 
 class BigramLanguageModel(nn.Module):
@@ -130,6 +135,15 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
+        self.apply(self._init_weigths)
+
+    def _init_weigths(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -179,6 +193,10 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
+with open('model-01.pkl', 'wb') as f:
+    pickle.dump(model,f)
+print("Model saved")
+
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-
+print("--- %s seconds ---" % (time.time() - start_time))
