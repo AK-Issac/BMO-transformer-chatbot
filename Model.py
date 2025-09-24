@@ -1,46 +1,56 @@
-# Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Decoder with model creation New*
-# Works on character-level
+# Source: https://www.youtube.com/watch?v=kCc8FmEb1nY
+# Decoder only with model creation
+# Works on word-level New*
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-import pickle
+import torch.nn.functional as F
 import time
+import nltk
+import pickle
+
+# Ensure nltk is installed and download necessary resources if needed
+# nltk.download('punkt')
+
 start_time = time.time()
 
 # hyperparameters
-batch_size = 8  # Increased for faster training if memory allows
-block_size = 16  # Increased to capture more context
-max_iters = 5000  # Increased for potentially better convergence
+batch_size = 8
+block_size = 16
+max_iters = 5000
 eval_interval = 1000
-learning_rate = 2e-3  # Lowered for more stable learning
+learning_rate = 2e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 100
-n_embed = 32 # Increased for capturing richer embeddings
+n_embed = 32
 n_head = 4
 n_layer = 2
 dropout = 0.2
 
 torch.manual_seed(1337)
 
+# Load data
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-chars = sorted(list(set(text)))
-words = sorted(list(set(text.split())))
-vocab_size = len(chars)
+# Word-level tokenization
+words = nltk.word_tokenize(text.lower())
+vocab = sorted(set(words))
+vocab_size = len(vocab)
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join([itos[i] for i in l])
+# Create mapping from word to index and index to word
+stoi = {word: i for i, word in enumerate(vocab)}
+itos = {i: word for i, word in enumerate(vocab)}
 
-data = torch.tensor(encode(text), dtype=torch.long)
+# Encoding and decoding functions
+encode = lambda s: [stoi[word] for word in s]
+decode = lambda l: ' '.join([itos[i] for i in l])
+
+# Encode the entire dataset
+data = torch.tensor(encode(words), dtype=torch.long)
 n = int(0.8 * len(data))
 train_data = data[:n]
 val_data = data[n:]
-
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data
@@ -50,7 +60,6 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
-
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -59,7 +68,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y)  # Removed adj_matrix from here
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -75,10 +84,10 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B,T,C = x.shape
+        B, T, C = x.shape
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
@@ -135,25 +144,24 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
-        self.apply(self._init_weigths)
+        self.apply(self._init_weights)
 
-    def _init_weigths(self, module):
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.lm_head(x) #tok_emb
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -168,20 +176,20 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
-            logits = logits[:, - 1, :]
+            logits, _ = self(idx_cond)  # Removed the loss since it's not needed here
+            logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+# Initialize model
 model = BigramLanguageModel()
-m = model.to(device)
+model = model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 for iter in range(max_iters):
-
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -193,10 +201,14 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
-with open('model-01.pkl', 'wb') as f:
+
+with open('model-02.pkl', 'wb') as f:
     pickle.dump(model,f)
 print("Model saved")
 
+# Generate text
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+generated_text = model.generate(context, max_new_tokens=500)
+print(decode(generated_text[0].tolist()))
+
 print("--- %s seconds ---" % (time.time() - start_time))

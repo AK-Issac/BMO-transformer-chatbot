@@ -1,37 +1,46 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Number of hour put in the ai: 20h
-# Run on model-01.pkl (ModelV2.py)
+# Run on model-02.pkl (ModelV3.py)
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import pickle
+import nltk
+from nltk.tokenize import word_tokenize
+
+# Download the punkt tokenizer if you haven't already
+nltk.download('punkt')
 
 # hyperparameters
-batch_size = 8  # Increased for faster training if memory allows
-block_size = 16  # Increased to capture more context
-max_iters = 5000  # Increased for potentially better convergence
+batch_size = 8
+block_size = 16
+max_iters = 5000
 eval_interval = 1000
-learning_rate = 2e-3  # Lowered for more stable learning
+learning_rate = 2e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 100
-n_embed = 32 # Increased for capturing richer embeddings
+n_embed = 32
 n_head = 4
 n_layer = 2
 dropout = 0.2
 
 torch.manual_seed(1337)
 
+# Load and tokenize the text
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
+# Tokenization using NLTK
+words = word_tokenize(text)
+vocab = sorted(set(words))
+vocab_size = len(vocab)
 
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join([itos[i] for i in l])
+# Create mappings from word to index and vice versa
+stoi = {word: i for i, word in enumerate(vocab)}
+itos = {i: word for i, word in enumerate(vocab)}
+encode = lambda s: [stoi[word] for word in word_tokenize(s)]
+decode = lambda l: ' '.join([itos[i] for i in l])
 
+# Model classes
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -42,10 +51,10 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B,T,C = x.shape
+        B, T, C = x.shape
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
@@ -102,25 +111,24 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
-        self.apply(self._init_weigths)
+        self.apply(self._init_weights)
 
-    def _init_weigths(self, module):
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.lm_head(x) #tok_emb
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -136,21 +144,23 @@ class BigramLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
-            logits = logits[:, - 1, :]
+            logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+# Load model
 model = BigramLanguageModel()
 print('loading model parameters...')
-with open('model-01.pkl', 'rb') as f:
+with open('model-02.pkl', 'rb') as f:
     model = pickle.load(f)
 print('loaded successfully')
 m = model.to(device)
 
+# Interaction loop
 while True:
     prompt = input("Prompt:\n")
-    context = torch.tensor(encode(prompt), dtype=torch.long, device=device)
-    generated_chars = decode(m.generate(context.unsqueeze(0), max_new_tokens=150)[0].tolist())
-    print(f"Completion:\n{generated_chars}")
+    context = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+    generated_words = decode(m.generate(context, max_new_tokens=150)[0].tolist())
+    print(f"Completion:\n{generated_words}")
