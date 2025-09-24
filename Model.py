@@ -1,6 +1,7 @@
 # Source: https://www.youtube.com/watch?v=kCc8FmEb1nY
-# Decoder only with model creation
-# Works on word-level New*
+# Decoder with model creation
+# Works on word-level
+# Implementation of an GNN model New*
 
 import torch
 import torch.nn as nn
@@ -52,6 +53,7 @@ n = int(0.8 * len(data))
 train_data = data[:n]
 val_data = data[n:]
 
+
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -59,6 +61,7 @@ def get_batch(split):
     y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
     x, y = x.to(device), y.to(device)
     return x, y
+
 
 @torch.no_grad()
 def estimate_loss():
@@ -68,11 +71,23 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)  # Removed adj_matrix from here
+            logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+
+
+class GNNLayer(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.linear = nn.Linear(n_embed, n_embed)
+
+    def forward(self, x, adj):
+        x = self.linear(x)
+        x = torch.matmul(adj, x)
+        return x
+
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -95,6 +110,7 @@ class Head(nn.Module):
         out = wei @ v
         return out
 
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -106,6 +122,7 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
+
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed):
@@ -119,6 +136,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
 
 class Block(nn.Module):
     def __init__(self, n_embed, n_head):
@@ -136,11 +154,13 @@ class Block(nn.Module):
         x = self.ln2(x + y)
         return x
 
-class BigramLanguageModel(nn.Module):
+
+class BigramLanguageModelWithGNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.gnn_layer = GNNLayer(n_embed)  # Add GNN layer here
         self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -159,6 +179,11 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
+
+        # Pass through GNN layer
+        adj_matrix = torch.eye(T, device=device).float()  # Define the adjacency matrix
+        x = self.gnn_layer(x, adj_matrix)
+
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -176,15 +201,16 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)  # Removed the loss since it's not needed here
+            logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
+
 # Initialize model
-model = BigramLanguageModel()
+model = BigramLanguageModelWithGNN()
 model = model.to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -195,15 +221,14 @@ for iter in range(max_iters):
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
     xb, yb = get_batch('train')
-
     logits, loss = model(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-
-with open('model-02.pkl', 'wb') as f:
-    pickle.dump(model,f)
+# Save the model
+with open('model-03.pkl', 'wb') as f:
+    pickle.dump(model, f)
 print("Model saved")
 
 # Generate text

@@ -1,14 +1,17 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Run on model-02.pkl (ModelV3.py)
+# Run on model-03.pkl (ModelV4.py)
+
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-import pickle
+import torch.nn.functional as F
+import time
 import nltk
-from nltk.tokenize import word_tokenize
+import pickle
 
-# Download the punkt tokenizer if you haven't already
-nltk.download('punkt')
+# Ensure nltk is installed and download necessary resources if needed
+# nltk.download('punkt')
+
+start_time = time.time()
 
 # hyperparameters
 batch_size = 8
@@ -25,22 +28,34 @@ dropout = 0.2
 
 torch.manual_seed(1337)
 
-# Load and tokenize the text
+# Load data
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
-# Tokenization using NLTK
-words = word_tokenize(text)
+# Word-level tokenization
+words = nltk.word_tokenize(text.lower())
 vocab = sorted(set(words))
 vocab_size = len(vocab)
 
-# Create mappings from word to index and vice versa
+# Create mapping from word to index and index to word
 stoi = {word: i for i, word in enumerate(vocab)}
 itos = {i: word for i, word in enumerate(vocab)}
-encode = lambda s: [stoi[word] for word in word_tokenize(s)]
+
+# Encoding and decoding functions
+encode = lambda s: [stoi[word] for word in s]
 decode = lambda l: ' '.join([itos[i] for i in l])
 
-# Model classes
+class GNNLayer(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.linear = nn.Linear(n_embed, n_embed)
+
+    def forward(self, x, adj):
+        x = self.linear(x)
+        x = torch.matmul(adj, x)
+        return x
+
+
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -62,6 +77,7 @@ class Head(nn.Module):
         out = wei @ v
         return out
 
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -73,6 +89,7 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
+
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed):
@@ -86,6 +103,7 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
 
 class Block(nn.Module):
     def __init__(self, n_embed, n_head):
@@ -103,11 +121,13 @@ class Block(nn.Module):
         x = self.ln2(x + y)
         return x
 
-class BigramLanguageModel(nn.Module):
+
+class BigramLanguageModelWithGNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.gnn_layer = GNNLayer(n_embed)  # Add GNN layer here
         self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
@@ -126,6 +146,11 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
+
+        # Pass through GNN layer
+        adj_matrix = torch.eye(T, device=device).float()  # Define the adjacency matrix
+        x = self.gnn_layer(x, adj_matrix)
+
         x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -143,24 +168,30 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, loss = self(idx_cond)
+            logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-# Load model
-model = BigramLanguageModel()
-print('loading model parameters...')
-with open('model-02.pkl', 'rb') as f:
-    model = pickle.load(f)
-print('loaded successfully')
-m = model.to(device)
 
-# Interaction loop
+# Initialize model
+model = BigramLanguageModelWithGNN()
+model = model.to(device)
+
+# Load trained model from file if available
+try:
+    with open('model-03.pkl', 'rb') as f:
+        model = pickle.load(f)
+    print("Model loaded successfully.")
+except FileNotFoundError:
+    print("Trained model not found. Please train the model first.")
+
+# Allow user to input a prompt and generate text
 while True:
-    prompt = input("Prompt:\n")
-    context = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
-    generated_words = decode(m.generate(context, max_new_tokens=150)[0].tolist())
-    print(f"Completion:\n{generated_words}")
+    prompt = input("Enter a prompt: ")
+    context = torch.tensor(encode(nltk.word_tokenize(prompt.lower())), dtype=torch.long, device=device).unsqueeze(0)
+    generated_idx = model.generate(context, max_new_tokens=500).tolist()[0]
+    generated_text = decode(generated_idx)
+    print(f"Generated text:\n{generated_text}")
