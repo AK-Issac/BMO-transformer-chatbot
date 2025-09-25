@@ -88,9 +88,4 @@ If you’ve ever wanted to peek under the hood of large language models, BMO is 
 
 ---
 
-## License
 
-Released under the **MIT License** — free to use, modify, and learn from.
-
-```
-```
