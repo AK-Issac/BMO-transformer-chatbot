@@ -1,6 +1,5 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Run on model-04.pkl (ModelV5.py)
-# BMO v4
+# Run on model-05.pkl (ModelV6.py)
 
 import torch
 import torch.nn as nn
@@ -14,7 +13,7 @@ import pickle
 
 start_time = time.time()
 
-# hyperparameters
+# Hyperparameters
 batch_size = 8
 block_size = 16
 max_iters = 5000
@@ -45,47 +44,9 @@ vocab_size = len(vocab)
 stoi = {word: i for i, word in enumerate(vocab)}
 itos = {i: word for i, word in enumerate(vocab)}
 
-# Encoding function with unknown word handling as a lambda function
+# Encoding and decoding functions
 encode = lambda sentence: [stoi.get(word, stoi['<unk>']) for word in sentence]
 decode = lambda l: ' '.join([itos[i] for i in l])
-
-# Encode the entire dataset
-data = torch.tensor(encode(words), dtype=torch.long)
-n = int(0.8 * len(data))
-train_data = data[:n]
-val_data = data[n:]
-
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i + block_size] for i in ix])
-    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-class GNNLayer(nn.Module):
-    def __init__(self, n_embed):
-        super().__init__()
-        self.linear = nn.Linear(n_embed, n_embed)
-
-    def forward(self, x, adj):
-        x = self.linear(x)
-        x = torch.matmul(adj, x)
-        return x
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -149,36 +110,44 @@ class Block(nn.Module):
         x = self.ln2(x + y)
         return x
 
-class BigramLanguageModelWithGNN(nn.Module):
-    def __init__(self):
+class EnglishEncoder(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads, num_layers, max_length):
+        super(EnglishEncoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding = self.create_positional_encoding(max_length, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, num_heads) for _ in range(num_layers)])
+
+    def create_positional_encoding(self, max_length, d_model):
+        position = torch.arange(max_length).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model))
+        pos_enc = torch.zeros(max_length, d_model)
+        pos_enc[:, 0::2] = torch.sin(position * div_term)
+        pos_enc[:, 1::2] = torch.cos(position * div_term)
+        return pos_enc.unsqueeze(0)  # Shape: (1, max_length, d_model)
+
+    def forward(self, x):
+        seq_length = x.size(1)
+        x = self.embedding(x) + self.positional_encoding[:, :seq_length, :]
+        for block in self.blocks:
+            x = block(x)  # Use the Block class
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, n_embed, n_head, n_layer, dropout):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.gnn_layer = GNNLayer(n_embed)  # Add GNN layer here
-        self.blocks = nn.Sequential(*(Block(n_embed, n_head=n_head) for _ in range(n_layer)))
+        self.blocks = nn.ModuleList([Block(n_embed, n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
-
-        # Pass through GNN layer
-        adj_matrix = torch.eye(T, device=device).float()  # Define the adjacency matrix
-        x = self.gnn_layer(x, adj_matrix)
-
-        x = self.blocks(x)
+        for block in self.blocks:
+            x = block(x)  # Use the Block class
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -192,10 +161,21 @@ class BigramLanguageModelWithGNN(nn.Module):
 
         return logits, loss
 
+class BigramLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = EnglishEncoder(vocab_size, n_embed, n_head, n_layer, block_size)
+        self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
+
+    def forward(self, idx, targets=None):
+        encoder_output = self.encoder(idx)  # Use the encoder
+        logits, loss = self.decoder(idx, targets)
+        return logits, loss
+
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)
+            logits, _ = self.decoder(idx_cond)  # Removed the loss since it's not needed here
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -203,12 +183,12 @@ class BigramLanguageModelWithGNN(nn.Module):
         return idx
 
 # Initialize model
-model = BigramLanguageModelWithGNN()
+model = BigramLanguageModel()
 model = model.to(device)
 
 # Load trained model from file if available
 try:
-    with open('model-04.pkl', 'rb') as f:
+    with open('model-05.pkl', 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully.")
 except FileNotFoundError:
