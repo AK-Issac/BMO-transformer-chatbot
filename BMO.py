@@ -1,5 +1,6 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Run on model-03.pkl (ModelV4.py)
+# Run on model-04.pkl (ModelV5.py)
+# BMO v4
 
 import torch
 import torch.nn as nn
@@ -35,15 +36,46 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 # Word-level tokenization
 words = nltk.word_tokenize(text.lower())
 vocab = sorted(set(words))
+
+# Add <UNK> token to the vocabulary
+vocab.insert(0, '<unk>')
 vocab_size = len(vocab)
 
 # Create mapping from word to index and index to word
 stoi = {word: i for i, word in enumerate(vocab)}
 itos = {i: word for i, word in enumerate(vocab)}
 
-# Encoding and decoding functions
-encode = lambda s: [stoi[word] for word in s]
+# Encoding function with unknown word handling as a lambda function
+encode = lambda sentence: [stoi.get(word, stoi['<unk>']) for word in sentence]
 decode = lambda l: ' '.join([itos[i] for i in l])
+
+# Encode the entire dataset
+data = torch.tensor(encode(words), dtype=torch.long)
+n = int(0.8 * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+def get_batch(split):
+    data = train_data if split == 'train' else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
 class GNNLayer(nn.Module):
     def __init__(self, n_embed):
@@ -54,7 +86,6 @@ class GNNLayer(nn.Module):
         x = self.linear(x)
         x = torch.matmul(adj, x)
         return x
-
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -77,7 +108,6 @@ class Head(nn.Module):
         out = wei @ v
         return out
 
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -89,7 +119,6 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
-
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed):
@@ -103,7 +132,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
 
 class Block(nn.Module):
     def __init__(self, n_embed, n_head):
@@ -120,7 +148,6 @@ class Block(nn.Module):
         y = self.ffwd(x)
         x = self.ln2(x + y)
         return x
-
 
 class BigramLanguageModelWithGNN(nn.Module):
     def __init__(self):
@@ -175,14 +202,13 @@ class BigramLanguageModelWithGNN(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-
 # Initialize model
 model = BigramLanguageModelWithGNN()
 model = model.to(device)
 
 # Load trained model from file if available
 try:
-    with open('model-03.pkl', 'rb') as f:
+    with open('model-04.pkl', 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully.")
 except FileNotFoundError:
