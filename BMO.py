@@ -1,5 +1,5 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Run on model-05.pkl (ModelV6.py)
+# Run on model-06.pkl (ModelV7.py)
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,7 @@ n_embed = 32
 n_head = 4
 n_layer = 2
 dropout = 0.2
+lstm_hidden_size = n_embed  # Size of LSTM hidden state
 
 torch.manual_seed(1337)
 
@@ -123,13 +124,13 @@ class EnglishEncoder(nn.Module):
         pos_enc = torch.zeros(max_length, d_model)
         pos_enc[:, 0::2] = torch.sin(position * div_term)
         pos_enc[:, 1::2] = torch.cos(position * div_term)
-        return pos_enc.unsqueeze(0)  # Shape: (1, max_length, d_model)
+        return pos_enc.unsqueeze(0)
 
     def forward(self, x):
         seq_length = x.size(1)
         x = self.embedding(x) + self.positional_encoding[:, :seq_length, :]
         for block in self.blocks:
-            x = block(x)  # Use the Block class
+            x = block(x)
         return x
 
 class Decoder(nn.Module):
@@ -141,13 +142,17 @@ class Decoder(nn.Module):
         self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, memory_output=None, targets=None):
         B, T = idx.shape
         tok_emb = self.token_embedding_table(idx)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))
         x = tok_emb + pos_emb
+
+        if memory_output is not None:
+            x = x + memory_output[:, -T:, :]
+
         for block in self.blocks:
-            x = block(x)  # Use the Block class
+            x = block(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -161,21 +166,40 @@ class Decoder(nn.Module):
 
         return logits, loss
 
+class MemoryModule(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(MemoryModule, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+
+    def forward(self, x, hidden_state=None):
+        output, hidden_state = self.lstm(x, hidden_state)
+        return output, hidden_state
+
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = EnglishEncoder(vocab_size, n_embed, n_head, n_layer, block_size)
         self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
+        self.memory = MemoryModule(n_embed, n_embed)
 
     def forward(self, idx, targets=None):
-        encoder_output = self.encoder(idx)  # Use the encoder
-        logits, loss = self.decoder(idx, targets)
+        encoder_output = self.encoder(idx)
+        memory_output, hidden_state = self.memory(encoder_output)
+        logits, loss = self.decoder(idx, memory_output, targets)
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
+        hidden_state = (None, None)
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
-            logits, _ = self.decoder(idx_cond)  # Removed the loss since it's not needed here
+            encoder_output = self.encoder(idx_cond)
+            if hidden_state[0] is None:
+                hidden_state = (
+                    torch.zeros(1, idx_cond.size(0), n_embed, device=device),
+                    torch.zeros(1, idx_cond.size(0), n_embed, device=device)
+                )
+            memory_output, hidden_state = self.memory(encoder_output, hidden_state)
+            logits, _ = self.decoder(idx_cond, memory_output)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -188,7 +212,7 @@ model = model.to(device)
 
 # Load trained model from file if available
 try:
-    with open('model-05.pkl', 'rb') as f:
+    with open('model-06.pkl', 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully.")
 except FileNotFoundError:
