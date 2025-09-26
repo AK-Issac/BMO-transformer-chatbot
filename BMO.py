@@ -1,5 +1,5 @@
 # Source: https://www.youtube.com/watch?v=UU1WVnMk4E8
-# Run on model-06.pkl (ModelV7.py)
+# Run on model-07.pkl (ModelV8_TXT.py)
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,8 @@ n_embed = 32
 n_head = 4
 n_layer = 2
 dropout = 0.2
+temperature = 1.0  # Temperature for sampling
+top_k = 10  # Number of top tokens to sample from
 lstm_hidden_size = n_embed  # Size of LSTM hidden state
 
 torch.manual_seed(1337)
@@ -46,7 +48,7 @@ stoi = {word: i for i, word in enumerate(vocab)}
 itos = {i: word for i, word in enumerate(vocab)}
 
 # Encoding and decoding functions
-encode = lambda sentence: [stoi.get(word, stoi['<unk>']) for word in sentence]
+encode = lambda s: [stoi.get(word, stoi['<unk>']) for word in s]
 decode = lambda l: ' '.join([itos[i] for i in l])
 
 class Head(nn.Module):
@@ -181,6 +183,7 @@ class BigramLanguageModel(nn.Module):
         self.encoder = EnglishEncoder(vocab_size, n_embed, n_head, n_layer, block_size)
         self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
         self.memory = MemoryModule(n_embed, n_embed)
+        self.temperature = temperature  # Set temperature
 
     def forward(self, idx, targets=None):
         encoder_output = self.encoder(idx)
@@ -188,22 +191,49 @@ class BigramLanguageModel(nn.Module):
         logits, loss = self.decoder(idx, memory_output, targets)
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def top_k_sampling(self, logits, k):
+        # Apply temperature to logits
+        logits = logits / self.temperature
+        # Get the top k logits
+        top_k_values, top_k_indices = torch.topk(logits, k)
+        top_k_probs = F.softmax(top_k_values, dim=-1)
+
+        # Sample from the top k
+        idx_next = torch.multinomial(top_k_probs, num_samples=1)
+
+        # Ensure idx_next is within the valid vocabulary range
+        idx_next_token = top_k_indices[torch.arange(top_k_indices.size(0)), idx_next].squeeze().item()
+
+        if idx_next_token >= vocab_size:  # Handle out-of-range values
+            idx_next_token = vocab_size - 1  # Set to the last valid token in the vocabulary
+
+        return idx_next_token
+    def generate(self, idx, max_new_tokens, p=0.9):
         hidden_state = (None, None)
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -block_size:].to(device)  # Move to device if not already
             encoder_output = self.encoder(idx_cond)
+
             if hidden_state[0] is None:
                 hidden_state = (
                     torch.zeros(1, idx_cond.size(0), n_embed, device=device),
                     torch.zeros(1, idx_cond.size(0), n_embed, device=device)
                 )
+
             memory_output, hidden_state = self.memory(encoder_output, hidden_state)
             logits, _ = self.decoder(idx_cond, memory_output)
             logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
+
+            # Use top-k sampling to get the next token index
+            idx_next = self.top_k_sampling(logits, top_k)
+
+            # Check if the generated token is the same as the last token of the input
+            if idx_next == idx_cond[0, -1].item():
+                continue  # Skip this token and regenerate
+
+            # Convert idx_next to a tensor before concatenating
+            idx_next_tensor = torch.tensor([[idx_next]], dtype=torch.long, device=device)
+            idx = torch.cat((idx, idx_next_tensor), dim=1)
         return idx
 
 # Initialize model
@@ -212,7 +242,7 @@ model = model.to(device)
 
 # Load trained model from file if available
 try:
-    with open('model-06.pkl', 'rb') as f:
+    with open('model-07.pkl', 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully.")
 except FileNotFoundError:
