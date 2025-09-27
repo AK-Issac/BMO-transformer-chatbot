@@ -2,10 +2,11 @@
 # Decoder + Encoder with model creation
 # Works on word-level
 # Handle unknown words
-# Remove GNN Layer/Model because it doesn't fit the chatbot
+# Remove GNN Layer/Model because it doesn't fit the chatbot New*
 # Implementation of Memory mechanism (LSTM)
-# Implementation of Top-k Sampling (New param: temperature; Range: 0.7 - 1.2; 0.7 being less random but more coherent; 1.2 being more random but less coherent; 1.0 a bit of both) New*
-# Optimisation (Should now works on GPU) New*
+# Implementation of Top-k Sampling (New param: temperature; Range: 0.7 - 1.2; 0.7 being less random but more coherent; 1.2 being more random but less coherent; 1.0 a bit of both)
+# Optimisation (Should now works on GPU)
+# Implementation of EOS token New*
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,7 @@ words = nltk.word_tokenize(text.lower())
 vocab = sorted(set(words))
 
 # Add <UNK> token to the vocabulary
+vocab.insert(0, '</s>')
 vocab.insert(0, '<unk>')
 vocab_size = len(vocab)
 
@@ -55,7 +57,7 @@ itos = {i: word for i, word in enumerate(vocab)}
 
 # Encoding and decoding functions
 encode = lambda s: [stoi.get(word, stoi['<unk>']) for word in s]
-decode = lambda l: ' '.join([itos[i] for i in l])
+decode = lambda l: ' '.join([itos[i] for i in l]).replace(' < /s >', '</s>').replace('< /s >', '</s>').strip()
 
 # Encode the entire dataset
 data = torch.tensor(encode(words), dtype=torch.long)
@@ -218,58 +220,45 @@ class BigramLanguageModel(nn.Module):
         self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
         self.memory = MemoryModule(n_embed, n_embed)
         self.temperature = temperature  # Set temperature
+        self.eos_token = stoi['</s>']  # EOS token index
 
     def forward(self, idx, targets=None):
-        encoder_output = self.encoder(idx)
-        memory_output, hidden_state = self.memory(encoder_output)
-        logits, loss = self.decoder(idx, memory_output, targets)
+        # Encoding phase
+        enc_output = self.encoder(idx)
+
+        # Memory mechanism
+        enc_output, _ = self.memory(enc_output)
+
+        # Decoding phase
+        logits, loss = self.decoder(idx, enc_output, targets)
         return logits, loss
 
-    def top_k_sampling(self, logits, k):
-        # Apply temperature to logits
-        logits = logits / self.temperature
-        # Get the top k logits
-        top_k_values, top_k_indices = torch.topk(logits, k)
-        top_k_probs = F.softmax(top_k_values, dim=-1)
-
-        # Sample from the top k
-        idx_next = torch.multinomial(top_k_probs, num_samples=1)
-
-        # Ensure idx_next is within the valid vocabulary range
-        idx_next_token = top_k_indices[torch.arange(top_k_indices.size(0)), idx_next].squeeze().item()
-
-        if idx_next_token >= vocab_size:  # Handle out-of-range values
-            idx_next_token = vocab_size - 1  # Set to the last valid token in the vocabulary
-
-        return idx_next_token
-
-    def generate(self, idx, max_new_tokens, p=0.9):
-        hidden_state = (None, None)
+    def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:].to(device)  # Move to device if not already
-            encoder_output = self.encoder(idx_cond)
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
 
-            if hidden_state[0] is None:
-                hidden_state = (
-                    torch.zeros(1, idx_cond.size(0), n_embed, device=device),
-                    torch.zeros(1, idx_cond.size(0), n_embed, device=device)
-                )
+            # Apply temperature and top-k sampling
+            logits = logits[:, -1, :] / self.temperature
+            logits = F.softmax(logits, dim=-1)
+            top_logits, top_indices = torch.topk(logits, top_k)
 
-            memory_output, hidden_state = self.memory(encoder_output, hidden_state)
-            logits, _ = self.decoder(idx_cond, memory_output)
-            logits = logits[:, -1, :]
+            # Sample from top-k tokens
+            next_token = torch.multinomial(top_logits, num_samples=1)
+            next_token = top_indices.gather(1, next_token)
 
-            # Use top-k sampling to get the next token index
-            idx_next = self.top_k_sampling(logits, top_k)
+            # Debugging output
+            print(f"Generated token: {next_token.item()}, EOS token: {self.eos_token}")
 
-            # Check if the generated token is the same as the last token of the input
-            if idx_next == idx_cond[0, -1].item():
-                continue  # Skip this token and regenerate
+            idx = torch.cat((idx, next_token), dim=1)
 
-            # Convert idx_next to a tensor before concatenating
-            idx_next_tensor = torch.tensor([[idx_next]], dtype=torch.long, device=device)
-            idx = torch.cat((idx, idx_next_tensor), dim=1)
-        return idx
+            # Check if the EOS token is reached
+            if next_token.item() == self.eos_token:
+                print("EOS token reached.")
+                break
+
+        # Decode and format output to remove spaces around EOS token
+        return decode(idx[0].tolist()).strip()
 
 # Initialize model
 model = BigramLanguageModel()
@@ -289,7 +278,7 @@ for iter in range(max_iters):
     loss.backward()
     optimizer.step()
 
-with open('model-07.pkl', 'wb') as f:
+with open('model-08.pkl', 'wb') as f:
     pickle.dump(model, f)
 print("Model saved")
 
