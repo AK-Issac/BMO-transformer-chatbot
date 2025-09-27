@@ -1,22 +1,30 @@
 # Source: https://www.youtube.com/watch?v=kCc8FmEb1nY
 # Decoder + Encoder with model creation
-# Works on word-level
-# Handle unknown words
-# Remove GNN Layer/Model because it doesn't fit the chatbot New*
+# Works on a substring-level (BPE)
+# Remove GNN Layer/Model because it doesn't fit the chatbot
 # Implementation of Memory mechanism (LSTM)
 # Implementation of Top-k Sampling (New param: temperature; Range: 0.7 - 1.2; 0.7 being less random but more coherent; 1.2 being more random but less coherent; 1.0 a bit of both)
 # Optimisation (Should now works on GPU)
 # Implementation of EOS token New*
 
+# INFO
+# BPE creates 2 files, bpe.model and bpe.vocab, bpe.model is there to say how to the ai how to interprete the substring in bpe.vocab (file that has every substring for each word)
+# It shows red info in the prompt, this is normal, they are NOT errors
+# It's the log when it create the bpe.model and the bpe.vocab
+# Param: temperature; Range: 0.7 - 1.2; 0.7 being less random but more coherent; 1.2 being more random but less coherent; 1.0 a bit of both
+# Param: top_k; Range: 1 - x (still need to determine the max); 1-5: low randomness but more coherent; 10-30: allow variation while prioritizing high-probability token; 50+: more diversity/randomness but less coherent
+# THIS MODEL READ JSON FILE
+
+# WARNING
+# If you change the dataset, you will NEED to modify the value of the vocab_size on the line 56, it need to be equal or lower then the number of vocab in bpe.vocab (check the number of line in the file)
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
-import nltk
+import sentencepiece as spm  # For BPE tokenization
 import pickle
-
-# Ensure nltk is installed and download necessary resources if needed
-# nltk.download('punkt')
+from datasets import load_dataset  # Import the datasets library
 
 start_time = time.time()
 
@@ -34,33 +42,36 @@ n_layer = 2
 dropout = 0.2
 temperature = 1.0  # Temperature for sampling
 top_k = 10  # Number of top tokens to sample from
-lstm_hidden_size = n_embed  # Size of LSTM hidden state
 
 torch.manual_seed(1337)
 
-# Load data
-with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
+# Load dataset
+dataset = load_dataset("taskydata/baize_chatbot")
+text = "\n".join([f"Prompt: {d['topic']}\nResponse: {d['input']}" for d in dataset['train']])
 
-# Word-level tokenization
-words = nltk.word_tokenize(text.lower())
-vocab = sorted(set(words))
+# Write text to a temporary file
+with open('train_data.txt', 'w', encoding='utf-8') as f:
+    f.write(text)
 
-# Add <UNK> token to the vocabulary
-vocab.insert(0, '</s>')
-vocab.insert(0, '<unk>')
-vocab_size = len(vocab)
+# Train BPE model (use the temp file)
+# spm.SentencePieceTrainer.train(input='train_data.txt', model_prefix='bpe', vocab_size=72454)
 
-# Create mapping from word to index and index to word
-stoi = {word: i for i, word in enumerate(vocab)}
-itos = {i: word for i, word in enumerate(vocab)}
+# Clean up
+os.remove('train_data.txt')
 
-# Encoding and decoding functions
-encode = lambda s: [stoi.get(word, stoi['<unk>']) for word in s]
-decode = lambda l: ' '.join([itos[i] for i in l]).replace(' < /s >', '</s>').replace('< /s >', '</s>').strip()
+# Load the trained BPE model
+sp = spm.SentencePieceProcessor()
+sp.load('bpe.model')
+
+# BPE tokenization
+vocab_size = sp.get_piece_size()
+
+# Encoding and decoding functions using BPE
+encode = lambda s: sp.encode(s, out_type=int)
+decode = lambda l: sp.decode(l)
 
 # Encode the entire dataset
-data = torch.tensor(encode(words), dtype=torch.long)
+data = torch.tensor(encode(text), dtype=torch.long)
 n = int(0.8 * len(data))
 train_data = data[:n]
 val_data = data[n:]
@@ -153,7 +164,7 @@ class EnglishEncoder(nn.Module):
     def __init__(self, vocab_size, d_model, num_heads, num_layers, max_length):
         super(EnglishEncoder, self).__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.positional_encoding = self.create_positional_encoding(max_length, d_model)
+        self.positional_encoding = self.create_positional_encoding(max_length, d_model).to(device)  # Move to device
         self.blocks = nn.ModuleList([Block(d_model, num_heads) for _ in range(num_layers)])
 
     def create_positional_encoding(self, max_length, d_model):
@@ -166,7 +177,7 @@ class EnglishEncoder(nn.Module):
 
     def forward(self, x):
         seq_length = x.size(1)
-        x = self.embedding(x) + self.positional_encoding[:, :seq_length, :]
+        x = self.embedding(x) + self.positional_encoding[:, :seq_length, :].to(x.device)  # Ensure same device
         for block in self.blocks:
             x = block(x)
         return x
@@ -208,10 +219,19 @@ class MemoryModule(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(MemoryModule, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.hidden_size = hidden_size
 
     def forward(self, x, hidden_state=None):
-        output, hidden_state = self.lstm(x, hidden_state)
-        return output, hidden_state
+        if x.size(0) == 0:
+            raise ValueError("Input to LSTM is empty.")
+
+        # Use a fixed hidden state for demonstration
+        hidden_state = (torch.zeros(1, x.size(0), self.hidden_size, device=x.device),
+                        torch.zeros(1, x.size(0), self.hidden_size, device=x.device))
+
+        x, (h_n, c_n) = self.lstm(x, hidden_state)
+        return x, (h_n, c_n)
+
 
 class BigramLanguageModel(nn.Module):
     def __init__(self):
@@ -220,60 +240,121 @@ class BigramLanguageModel(nn.Module):
         self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
         self.memory = MemoryModule(n_embed, n_embed)
         self.temperature = temperature  # Set temperature
-        self.eos_token = stoi['</s>']  # EOS token index
+
+        # Define special tokens (e.g., EOS token)
+        self.eos_token_id = sp.piece_to_id('</s>')  # Replace with the actual EOS token if different
 
     def forward(self, idx, targets=None):
-        # Encoding phase
-        enc_output = self.encoder(idx)
-
-        # Memory mechanism
-        enc_output, _ = self.memory(enc_output)
-
-        # Decoding phase
-        logits, loss = self.decoder(idx, enc_output, targets)
+        encoder_output = self.encoder(idx)
+        memory_output, hidden_state = self.memory(encoder_output)
+        logits, loss = self.decoder(idx, memory_output, targets)
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def top_k_sampling(self, logits, k):
+        # Apply temperature to logits
+        logits = logits / self.temperature
+        # Get the top k logits
+        top_k_values, top_k_indices = torch.topk(logits, k)
+        top_k_probs = F.softmax(top_k_values, dim=-1)
+
+        # Sample from the top k
+        idx_next = torch.multinomial(top_k_probs, num_samples=1)  # shape [batch_size, 1]
+
+        # Gather the sampled indices from top_k_indices using idx_next
+        idx_next = top_k_indices[torch.arange(top_k_indices.size(0)).to(idx_next.device), idx_next.squeeze()]
+
+        return idx_next  # This should now return a tensor of shape [batch_size]
+
+    def generate(self, idx, max_new_tokens=500, p=0.9, max_length_limit=1000):
+        hidden_state = (None, None)
+        total_generated_length = 0
+
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:]
-            logits, _ = self(idx_cond)
-
-            # Apply temperature and top-k sampling
-            logits = logits[:, -1, :] / self.temperature
-            logits = F.softmax(logits, dim=-1)
-            top_logits, top_indices = torch.topk(logits, top_k)
-
-            # Sample from top-k tokens
-            next_token = torch.multinomial(top_logits, num_samples=1)
-            next_token = top_indices.gather(1, next_token)
-
-            # Debugging output
-            print(f"Generated token: {next_token.item()}, EOS token: {self.eos_token}")
-
-            idx = torch.cat((idx, next_token), dim=1)
-
-            # Check if the EOS token is reached
-            if next_token.item() == self.eos_token:
-                print("EOS token reached.")
+            # Check length limit
+            if total_generated_length >= max_length_limit:
                 break
 
-        # Decode and format output to remove spaces around EOS token
-        return decode(idx[0].tolist()).strip()
+            idx_cond = idx[:, -block_size:].to(device)  # Move to device if not already
+            encoder_output = self.encoder(idx_cond)
+
+            if hidden_state[0] is None:
+                hidden_state = (
+                    torch.zeros(1, idx_cond.size(0), n_embed, device=device),
+                    torch.zeros(1, idx_cond.size(0), n_embed, device=device)
+                )
+
+            memory_output, hidden_state = self.memory(encoder_output, hidden_state)  # Pass hidden_state here
+            logits, _ = self.decoder(idx_cond, memory_output)
+            logits = logits[:, -1, :]
+
+            # Use top-k sampling to get the next token index
+            idx_next = self.top_k_sampling(logits, top_k)
+
+            # Check if the generated token is an end token or an incomplete word token
+            if idx_next == self.eos_token_id or self.is_incomplete_word(idx_next):
+                continue  # Skip this token and regenerate
+
+            # Convert idx_next to a tensor before concatenating
+            idx_next_tensor = torch.tensor([[idx_next]], dtype=torch.long, device=device)
+            idx = torch.cat((idx, idx_next_tensor), dim=1)
+
+            # Update the total generated length
+            total_generated_length += 1
+
+            # Early stopping on punctuation (adjust as needed)
+            generated_text = decode(idx[0].tolist())
+            if generated_text[-1] in {'.', '!', '?'}:
+                break
+
+        return idx
+
+    def is_incomplete_word(self, token_id):
+        # If token_id is a tensor, extract the first element
+        if isinstance(token_id, torch.Tensor):
+            token_id = token_id.item()  # Get the scalar value from tensor
+        # Use SentencePiece to check if token is an incomplete word or special token
+        token = sp.id_to_piece(token_id)
+        return token.startswith('▁') is False and token != '</s>'  # Adjust condition as needed
+
+    def format_generated_text(self, generated_text):
+        # Break text into lines without cutting words
+        max_line_length = 150
+        lines = []
+        start = 0
+
+        while start < len(generated_text):
+            # Find the optimal break point within the max length
+            end = min(start + max_line_length, len(generated_text))
+
+            # Check if we need to break at a space or punctuation
+            if end < len(generated_text) and not generated_text[end].isspace():
+                # Move backwards to find a space or punctuation
+                while end > start and not generated_text[end].isspace():
+                    end -= 1
+
+            # If no space or punctuation is found, just break at the max length
+            if end == start:
+                end = start + max_line_length
+
+            # Append the line
+            lines.append(generated_text[start:end].strip())
+            start = end
+
+        return "\n".join(lines)
 
 # Initialize model
 model = BigramLanguageModel()
-model = model.to(device)
-
+model = model.to(device)  # Move model to device
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+# Training Loop
 for iter in range(max_iters):
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"Step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-    xb, yb = get_batch('train')
-
-    logits, loss = model(xb, yb)
+    x_batch, y_batch = get_batch('train')
+    logits, loss = model(x_batch, targets=y_batch)  # Changed 'decoder' to 'model'
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -283,8 +364,8 @@ with open('model-08.pkl', 'wb') as f:
 print("Model saved")
 
 # Generate text
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-generated_text = model.generate(context, max_new_tokens=500)
+context = torch.zeros((1, 1), dtype=torch.long, device=device)  # Ensure context is on device
+generated_text = model.generate(context, max_new_tokens=500, p=0.9)  # Adjust p as needed
 print(decode(generated_text[0].tolist()))
 
 print("--- %s seconds ---" % (time.time() - start_time))
