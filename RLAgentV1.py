@@ -1,10 +1,14 @@
-# Import necessary libraries
+# Creation of the Training for the RLAgent New*
+# The core of this agent is the model-08.pkl (ModelV9_TXT.py) New*
+# Implementation of the environment for RL New*
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
 import sentencepiece as spm  # For BPE tokenization
 import pickle
+import random
 
 start_time = time.time()
 
@@ -35,8 +39,6 @@ vocab_size = sp.get_piece_size()
 # Encoding and decoding functions using BPE
 encode = lambda s: sp.encode(s, out_type=int)
 decode = lambda l: sp.decode(l)
-
-# Define the Transformer components
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -165,6 +167,7 @@ class MemoryModule(nn.Module):
         if x.size(0) == 0:
             raise ValueError("Input to LSTM is empty.")
 
+        # Use a fixed hidden state for demonstration
         hidden_state = (torch.zeros(1, x.size(0), self.hidden_size, device=x.device),
                         torch.zeros(1, x.size(0), self.hidden_size, device=x.device))
 
@@ -177,9 +180,10 @@ class BigramLanguageModel(nn.Module):
         self.encoder = EnglishEncoder(vocab_size, n_embed, n_head, n_layer, block_size)
         self.decoder = Decoder(vocab_size, n_embed, n_head, n_layer, dropout)
         self.memory = MemoryModule(n_embed, n_embed)
-        self.temperature = temperature
+        self.temperature = temperature  # Set temperature
 
-        self.eos_token_id = sp.piece_to_id('</s>')
+        # Define special tokens (e.g., EOS token)
+        self.eos_token_id = sp.piece_to_id('</s>')  # Replace with the actual EOS token if different
 
     def forward(self, idx, targets=None):
         encoder_output = self.encoder(idx)
@@ -188,82 +192,175 @@ class BigramLanguageModel(nn.Module):
         return logits, loss
 
     def top_k_sampling(self, logits, k):
+        # Apply temperature to logits
         logits = logits / self.temperature
+        # Get the top k logits
         top_k_values, top_k_indices = torch.topk(logits, k)
         top_k_probs = F.softmax(top_k_values, dim=-1)
 
+        # Sample from the top k
         idx_next = torch.multinomial(top_k_probs, num_samples=1)
+
         return top_k_indices[torch.arange(top_k_indices.size(0)), idx_next].squeeze().item()
 
-    def generate_with_feedback(self, idx, max_new_tokens=500, rl_agent=None):
-        hidden_state = (None, None)
+    def generate(self, idx, max_new_tokens=500, p=0.9, max_length_limit=1000):
         total_generated_length = 0
-        reward_sum = 0  # Store total reward
 
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:].to(device)
-            encoder_output = self.encoder(idx_cond)
-            memory_output, hidden_state = self.memory(encoder_output, hidden_state)
-            logits, _ = self.decoder(idx_cond, memory_output)
-            logits = logits[:, -1, :]
-            idx_next = self.top_k_sampling(logits, top_k)
-
-            # Evaluate response using RL agent
-            if rl_agent:
-                response = decode(idx.tolist()[0])
-                reward = rl_agent.evaluate_response(response)
-                reward_sum += reward
-
-            # Early stopping on punctuation
-            if idx_next == self.eos_token_id:
+            # Check length limit
+            if total_generated_length >= max_length_limit:
                 break
 
+            idx_cond = idx[:, -block_size:].to(device)  # Move to device if not already
+            encoder_output = self.encoder(idx_cond)
+
+            # Use a fixed hidden state
+            hidden_state = (
+                torch.zeros(1, idx_cond.size(0), n_embed, device=device),
+                torch.zeros(1, idx_cond.size(0), n_embed, device=device)
+            )
+
+            memory_output, hidden_state = self.memory(encoder_output, hidden_state)  # Pass hidden_state here
+            logits, _ = self.decoder(idx_cond, memory_output)
+            logits = logits[:, -1, :]
+
+            # Use top-k sampling to get the next token index
+            idx_next = self.top_k_sampling(logits, top_k)
+
+            # Check if the generated token is an end token or an incomplete word token
+            if idx_next == self.eos_token_id or self.is_incomplete_word(idx_next):
+                continue  # Skip this token and regenerate
+
+            # Convert idx_next to a tensor before concatenating
             idx_next_tensor = torch.tensor([[idx_next]], dtype=torch.long, device=device)
             idx = torch.cat((idx, idx_next_tensor), dim=1)
+
+            # Update the total generated length
             total_generated_length += 1
 
-        return idx, reward_sum
+            # Early stopping on punctuation (adjust as needed)
+            generated_text = decode(idx[0].tolist())
+            if generated_text[-1] in {'.', '!', '?'}:
+                break
+
+        return idx
 
     def is_incomplete_word(self, token_id):
+        # Use SentencePiece to check if token is an incomplete word or special token
         token = sp.id_to_piece(token_id)
-        return token.startswith('▁') is False and token != '</s>'
+        return token.startswith('▁') is False and token != '</s>'  # Adjust condition as needed
 
-    def format_generated_text(self, text):
-        return text.replace(" ", "").replace("▁", " ")
+    def format_generated_text(self, generated_text):
+        # Break text into lines without cutting words
+        max_line_length = 150
+        lines = []
+        start = 0
 
-# Define the RL agent class
-class RLAgent:
-    def __init__(self):
-        self.rewards = []
+        while start < len(generated_text):
+            # Find the optimal break point within the max length
+            end = min(start + max_line_length, len(generated_text))
 
-    def evaluate_response(self, response):
-        # Simple reward logic based on response length, could be more advanced
-        if len(response) > 100:  # Reward long and coherent responses
-            reward = 1
-        else:
-            reward = -1  # Penalize too short or incoherent responses
+            # Check if we need to break at a space or punctuation
+            if end < len(generated_text) and not generated_text[end].isspace():
+                # Move backwards to find a space or punctuation
+                while end > start and not generated_text[end].isspace():
+                    end -= 1
 
-        self.rewards.append(reward)
-        return reward
+            # If no space or punctuation is found, just break at the max length
+            if end == start:
+                end = start + max_line_length
 
-# Initialize model and RL agent
+            # Append the line
+            lines.append(generated_text[start:end].strip())
+            start = end
+
+        return "\n".join(lines)
+
+class ChatbotEnvironment:
+    def __init__(self, model, eos_token_id, max_turns=5):
+        self.model = model
+        self.eos_token_id = eos_token_id
+        self.max_turns = max_turns
+        self.reset()
+
+    def reset(self):
+        self.current_turn = 0
+        self.prompt = ""  # Initialize the prompt
+        return self.get_state()
+
+    def get_state(self):
+        # Return the current state of the environment (e.g., the current prompt)
+        return torch.tensor(encode(self.prompt), dtype=torch.long).unsqueeze(0)  # Encode the prompt
+
+    def step(self, action):
+        response_idx = torch.tensor([[action]], dtype=torch.long)
+        self.prompt += decode(response_idx.tolist()[0])  # Update the prompt
+
+        # Get current state
+        current_state = self.get_state()
+
+        # Check if the current state is empty
+        if current_state.size(1) == 0:  # Sequence length is zero
+            return current_state, 0, True  # Return immediately
+
+        # Generate text based on the updated prompt
+        try:
+            generated_idx = self.model.generate(current_state, max_new_tokens=1)
+        except Exception as e:
+            print("Error during text generation:", str(e))
+            raise  # Re-raise to get the full stack trace
+
+        generated_text = decode(generated_idx[0].tolist())
+
+        # Update the prompt with the generated text
+        self.prompt += generated_text
+
+        # Calculate reward (e.g., based on response length, coherence, user feedback, etc.)
+        reward = self.calculate_reward(generated_text)
+
+        self.current_turn += 1
+        done = self.current_turn >= self.max_turns or action == self.eos_token_id  # End if max turns reached or EOS token
+
+        return self.get_state(), reward, done
+
+    def calculate_reward(self, response):
+        # Define your reward logic here
+        # For simplicity, we can use the length of the response as a reward
+        return len(response)  # Example: longer responses yield higher rewards
+
+# Load trained model from file if available
 try:
     with open('model-08.pkl', 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully.")
 except FileNotFoundError:
     print("Trained model not found. Please train the model first.")
-rl_agent = RLAgent()
 
-while True:
-    prompt = input("Enter a prompt: ")
-    context = torch.tensor(encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+# RL Training Loop
+num_episodes = 1000  # Number of training episodes
 
-    # Generate text with RL agent providing feedback
-    generated_idx, total_reward = model.generate_with_feedback(context, rl_agent=rl_agent)
-    generated_text = decode(generated_idx.tolist()[0])
-    formatted_text = model.format_generated_text(generated_text)
+# Initialize the environment
 
-    # Show the generated text and the reward received
-    print(f"Generated text:\n{formatted_text}")
-    print(f"Total reward received: {total_reward}")
+env = ChatbotEnvironment(model, model.eos_token_id)
+
+for episode in range(num_episodes):
+    state = env.reset()
+    total_reward = 0
+    done = False
+
+    while not done:
+        # Here, you need to define your agent's action selection logic
+        action = random.randint(0, vocab_size - 1)  # Placeholder: Random action
+
+        next_state, reward, done = env.step(action)
+        total_reward += reward
+
+        # Update your RL agent's knowledge based on the action taken and reward received
+        # (This part will depend on the specific RL algorithm you choose)
+
+    print(f"Episode {episode + 1}/{num_episodes} finished with total reward: {total_reward}")
+
+# Save the trained model after training
+with open('rlagent-01.pkl', 'wb') as f:
+    pickle.dump(model, f)
+print("RLAgent saved successfully.")
